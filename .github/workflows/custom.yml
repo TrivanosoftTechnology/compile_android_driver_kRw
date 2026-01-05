@@ -1,4 +1,4 @@
-name: Android Kernel Driver Builder (Custom Kernel / Single Module)
+name: Android Kernel Driver Builder (Custom Kernel / Single Module / Auto Toolchain)
 
 on:
   workflow_dispatch:
@@ -55,7 +55,9 @@ jobs:
           sudo apt install -y \
             build-essential git curl wget bison flex zip bc cpio libssl-dev \
             ccache python-is-python3 tar rsync libelf-dev \
-            llvm lld
+            llvm lld \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
 
       - name: Setup zyc-clang toolchain
         run: |
@@ -73,7 +75,7 @@ jobs:
           mkdir -p kerneldriver
           rsync -av --delete code/ kerneldriver/
 
-          # Ensure the 3 source files exist
+          # Ensure these exist (adjust if your filenames differ)
           test -f kerneldriver/memory.c
           test -f kerneldriver/process.c
           test -f kerneldriver/entry.c
@@ -98,17 +100,59 @@ jobs:
             git clone --depth=1 "${{ github.event.inputs.kernel_repo }}" android-kernel
           fi
 
-      - name: Build kernel (generates out/)
+      - name: Build kernel (capture log)
         run: |
           set -eux
           cd android-kernel
+
+          export PATH="$HOME/zyc-clang/bin:$PATH"
+
           if [ "${{ github.event.inputs.include_ksu }}" = "true" ]; then
-            bash build.sh "${{ github.event.inputs.device }}" ksu
+            bash build.sh "${{ github.event.inputs.device }}" ksu 2>&1 | tee "$GITHUB_WORKSPACE/build_kernel.log"
           else
-            bash build.sh "${{ github.event.inputs.device }}"
+            bash build.sh "${{ github.event.inputs.device }}" 2>&1 | tee "$GITHUB_WORKSPACE/build_kernel.log"
           fi
 
-      - name: Prepare kernel for external modules (fix arm64 clang target + non-interactive config)
+      - name: Auto-detect toolchain prefixes from build log
+        run: |
+          set -eux
+
+          LOG="$GITHUB_WORKSPACE/build_kernel.log"
+          test -f "$LOG"
+
+          # Try to find explicit exports like:
+          # export CROSS_COMPILE=...
+          # CROSS_COMPILE=...
+          # make ... CROSS_COMPILE=...
+          CC_PREFIX="$(grep -Eo 'CROSS_COMPILE=([A-Za-z0-9_./+-]+-)' "$LOG" | head -n1 | cut -d= -f2 || true)"
+          CC32_PREFIX="$(grep -Eo 'CROSS_COMPILE_ARM32=([A-Za-z0-9_./+-]+-)' "$LOG" | head -n1 | cut -d= -f2 || true)"
+          CLANG_TRIPLE="$(grep -Eo 'CLANG_TRIPLE=([A-Za-z0-9_./+-]+-)' "$LOG" | head -n1 | cut -d= -f2 || true)"
+
+          # If not found, try to infer from common patterns in printed commands
+          # e.g. "aarch64-linux-android-gcc", "aarch64-linux-gnu-gcc"
+          if [ -z "$CC_PREFIX" ]; then
+            CC_PREFIX="$(grep -Eo '([A-Za-z0-9_./+-]*aarch64[A-Za-z0-9_./+-]*-)(gcc|ld|as)\b' "$LOG" | head -n1 | sed -E 's/(gcc|ld|as)$//' || true)"
+          fi
+          if [ -z "$CC32_PREFIX" ]; then
+            CC32_PREFIX="$(grep -Eo '([A-Za-z0-9_./+-]*arm[A-Za-z0-9_./+-]*-)(gcc|ld|as)\b' "$LOG" | head -n1 | sed -E 's/(gcc|ld|as)$//' || true)"
+          fi
+
+          # Fallbacks (safe on GH runners because we apt-installed these)
+          : "${CC_PREFIX:=aarch64-linux-gnu-}"
+          : "${CC32_PREFIX:=arm-linux-gnueabi-}"
+          : "${CLANG_TRIPLE:=$CC_PREFIX}"
+
+          echo "Detected CROSS_COMPILE=$CC_PREFIX"
+          echo "Detected CROSS_COMPILE_ARM32=$CC32_PREFIX"
+          echo "Detected CLANG_TRIPLE=$CLANG_TRIPLE"
+
+          {
+            echo "CROSS_COMPILE=$CC_PREFIX"
+            echo "CROSS_COMPILE_ARM32=$CC32_PREFIX"
+            echo "CLANG_TRIPLE=$CLANG_TRIPLE"
+          } >> $GITHUB_ENV
+
+      - name: modules_prepare (non-interactive, using detected prefixes)
         run: |
           set -eux
           cd android-kernel
@@ -116,6 +160,7 @@ jobs:
           export PATH="$HOME/zyc-clang/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
+
           export CC=clang
           export LD=ld.lld
           export AR=llvm-ar
@@ -124,14 +169,11 @@ jobs:
           export OBJDUMP=llvm-objdump
           export STRIP=llvm-strip
 
-          # Critical: ensure clang targets arm64 so w0/x1 asm registers are recognized
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          echo "Using CROSS_COMPILE=$CROSS_COMPILE"
+          echo "Using CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32"
+          echo "Using CLANG_TRIPLE=$CLANG_TRIPLE"
 
-          # Avoid interactive Kconfig prompts in CI
           yes "" | make O=out olddefconfig
-
           make O=out modules_prepare
 
       - name: Build the single module (.ko)
@@ -142,6 +184,7 @@ jobs:
           export PATH="$HOME/zyc-clang/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
+
           export CC=clang
           export LD=ld.lld
           export AR=llvm-ar
@@ -149,13 +192,9 @@ jobs:
           export OBJCOPY=llvm-objcopy
           export OBJDUMP=llvm-objdump
           export STRIP=llvm-strip
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
           make O=out M="${GITHUB_WORKSPACE}/kerneldriver" modules -j"$(nproc)"
 
-          # Verify the expected single .ko exists
           ls -lah "${GITHUB_WORKSPACE}/kerneldriver/${{ github.event.inputs.driver_name }}.ko"
 
       - name: Upload module artifact
