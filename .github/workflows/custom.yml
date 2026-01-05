@@ -16,9 +16,9 @@ on:
           - "true"
           - "false"
       driver_name:
-        description: "Single module base name (NO .ko). Example: kerneldriver"
+        description: "Single module base name (NO .ko). Example: mydriver"
         required: true
-        default: "kerneldriver"
+        default: "mydriver"
       kernel_repo:
         description: "Kernel source repo"
         required: true
@@ -55,7 +55,7 @@ jobs:
           sudo apt install -y \
             build-essential git curl wget bison flex zip bc cpio libssl-dev \
             ccache python-is-python3 tar rsync libelf-dev \
-            clang llvm lld
+            llvm lld
 
       - name: Setup zyc-clang toolchain
         run: |
@@ -66,15 +66,19 @@ jobs:
           tar -zxf Clang-15.0.7-20251111.tar.gz
           echo "$HOME/zyc-clang/bin" >> $GITHUB_PATH
 
-      - name: Prepare module sources and force single-module Makefile
+      - name: Prepare single-module sources (force one .ko)
         run: |
           set -eux
           rm -rf kerneldriver
           mkdir -p kerneldriver
           rsync -av --delete code/ kerneldriver/
 
-          # Force a single-module Makefile using driver_name
-          # This produces: <driver_name>.ko built from memory.c process.c entry.c
+          # Ensure the 3 source files exist
+          test -f kerneldriver/memory.c
+          test -f kerneldriver/process.c
+          test -f kerneldriver/entry.c
+
+          # Force one output module: <driver_name>.ko
           cat > kerneldriver/Makefile <<'EOF'
           obj-m += __MOD__.o
           __MOD__-y := memory.o process.o entry.o
@@ -104,34 +108,58 @@ jobs:
             bash build.sh "${{ github.event.inputs.device }}"
           fi
 
-      - name: modules_prepare
+      - name: Prepare kernel for external modules (fix arm64 clang target + non-interactive config)
         run: |
           set -eux
           cd android-kernel
+
           export PATH="$HOME/zyc-clang/bin:$PATH"
           export ARCH=arm64
+          export SUBARCH=arm64
           export CC=clang
-          export LLVM=1
-          export LLVM_IAS=1
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+
+          # Critical: ensure clang targets arm64 so w0/x1 asm registers are recognized
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          # Avoid interactive Kconfig prompts in CI
+          yes "" | make O=out olddefconfig
+
           make O=out modules_prepare
 
-      - name: Build module
+      - name: Build the single module (.ko)
         run: |
           set -eux
           cd android-kernel
+
           export PATH="$HOME/zyc-clang/bin:$PATH"
           export ARCH=arm64
+          export SUBARCH=arm64
           export CC=clang
-          export LLVM=1
-          export LLVM_IAS=1
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
           make O=out M="${GITHUB_WORKSPACE}/kerneldriver" modules -j"$(nproc)"
 
+          # Verify the expected single .ko exists
           ls -lah "${GITHUB_WORKSPACE}/kerneldriver/${{ github.event.inputs.driver_name }}.ko"
 
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.device }}-${{ github.event.inputs.driver_name }}.ko
-          path: |
-            kerneldriver/${{ github.event.inputs.driver_name }}.ko
+          path: kerneldriver/${{ github.event.inputs.driver_name }}.ko
