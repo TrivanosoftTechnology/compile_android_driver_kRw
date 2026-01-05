@@ -1,10 +1,10 @@
-name: Build Kernel Modules (munch / custom kernel)
+name: Android Kernel Driver Builder (Custom Kernel / Single Module)
 
 on:
   workflow_dispatch:
     inputs:
       device:
-        description: "Device codename"
+        description: "Device codename (e.g., munch)"
         required: true
         default: "munch"
       include_ksu:
@@ -15,6 +15,10 @@ on:
         options:
           - "true"
           - "false"
+      driver_name:
+        description: "Single module base name (NO .ko). Example: kerneldriver"
+        required: true
+        default: "kerneldriver"
       kernel_repo:
         description: "Kernel source repo"
         required: true
@@ -39,7 +43,7 @@ jobs:
           remove-haskell: "true"
           remove-codeql: "true"
 
-      - name: Checkout module repository (this repo)
+      - name: Checkout module repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -62,17 +66,20 @@ jobs:
           tar -zxf Clang-15.0.7-20251111.tar.gz
           echo "$HOME/zyc-clang/bin" >> $GITHUB_PATH
 
-      - name: Prepare kerneldriver directory (external module)
+      - name: Prepare module sources and force single-module Makefile
         run: |
           set -eux
           rm -rf kerneldriver
           mkdir -p kerneldriver
           rsync -av --delete code/ kerneldriver/
-          test -f kerneldriver/Makefile
 
-          # Normalize Makefile: ensure newline at end + no CRLF issues
-          sed -i 's/\r$//' kerneldriver/Makefile
-          printf "\n" >> kerneldriver/Makefile
+          # Force a single-module Makefile using driver_name
+          # This produces: <driver_name>.ko built from memory.c process.c entry.c
+          cat > kerneldriver/Makefile <<'EOF'
+          obj-m += __MOD__.o
+          __MOD__-y := memory.o process.o entry.o
+          EOF
+          sed -i "s/__MOD__/${{ github.event.inputs.driver_name }}/g" kerneldriver/Makefile
 
           echo "=== kerneldriver/Makefile ==="
           cat kerneldriver/Makefile
@@ -87,7 +94,7 @@ jobs:
             git clone --depth=1 "${{ github.event.inputs.kernel_repo }}" android-kernel
           fi
 
-      - name: Build kernel (generates out/ used for module build)
+      - name: Build kernel (generates out/)
         run: |
           set -eux
           cd android-kernel
@@ -97,7 +104,7 @@ jobs:
             bash build.sh "${{ github.event.inputs.device }}"
           fi
 
-      - name: modules_prepare (required for external modules)
+      - name: modules_prepare
         run: |
           set -eux
           cd android-kernel
@@ -106,11 +113,9 @@ jobs:
           export CC=clang
           export LLVM=1
           export LLVM_IAS=1
-
-          # build.sh output dir is 'out' (based on your kernel workflow artifacts)
           make O=out modules_prepare
 
-      - name: Build external modules (.ko)
+      - name: Build module
         run: |
           set -eux
           cd android-kernel
@@ -120,21 +125,13 @@ jobs:
           export LLVM=1
           export LLVM_IAS=1
 
-          # Build ALL obj-m targets in your Makefile:
           make O=out M="${GITHUB_WORKSPACE}/kerneldriver" modules -j"$(nproc)"
 
-          echo "=== Built .ko files ==="
-          find "${GITHUB_WORKSPACE}/kerneldriver" -maxdepth 2 -name "*.ko" -print
+          ls -lah "${GITHUB_WORKSPACE}/kerneldriver/${{ github.event.inputs.driver_name }}.ko"
 
-      - name: Collect artifacts
-        run: |
-          set -eux
-          rm -rf artifacts
-          mkdir -p artifacts
-          find kerneldriver -name "*.ko" -exec cp -v {} artifacts/ \;
-
-      - name: Upload module artifacts
+      - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.device }}-modules
-          path: artifacts/*.ko
+          name: ${{ github.event.inputs.device }}-${{ github.event.inputs.driver_name }}.ko
+          path: |
+            kerneldriver/${{ github.event.inputs.driver_name }}.ko
