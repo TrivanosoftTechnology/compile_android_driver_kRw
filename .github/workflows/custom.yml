@@ -1,0 +1,140 @@
+name: Build Kernel Modules (munch / custom kernel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device codename"
+        required: true
+        default: "munch"
+      include_ksu:
+        description: "Include KSU"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      kernel_repo:
+        description: "Kernel source repo"
+        required: true
+        default: "https://github.com/NKR00711/kernel_xiaomi_sm8250_mod"
+      kernel_branch:
+        description: "Kernel branch (empty = default)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+
+      - name: Checkout module repository (this repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          sudo apt update
+          sudo apt install -y \
+            build-essential git curl wget bison flex zip bc cpio libssl-dev \
+            ccache python-is-python3 tar rsync libelf-dev \
+            clang llvm lld
+
+      - name: Setup zyc-clang toolchain
+        run: |
+          set -eux
+          mkdir -p "$HOME/zyc-clang"
+          cd "$HOME/zyc-clang"
+          wget -q https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20251111-release/Clang-15.0.7-20251111.tar.gz
+          tar -zxf Clang-15.0.7-20251111.tar.gz
+          echo "$HOME/zyc-clang/bin" >> $GITHUB_PATH
+
+      - name: Prepare kerneldriver directory (external module)
+        run: |
+          set -eux
+          rm -rf kerneldriver
+          mkdir -p kerneldriver
+          rsync -av --delete code/ kerneldriver/
+          test -f kerneldriver/Makefile
+
+          # Normalize Makefile: ensure newline at end + no CRLF issues
+          sed -i 's/\r$//' kerneldriver/Makefile
+          printf "\n" >> kerneldriver/Makefile
+
+          echo "=== kerneldriver/Makefile ==="
+          cat kerneldriver/Makefile
+
+      - name: Clone custom kernel source
+        run: |
+          set -eux
+          rm -rf android-kernel
+          if [ -n "${{ github.event.inputs.kernel_branch }}" ]; then
+            git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo }}" android-kernel
+          else
+            git clone --depth=1 "${{ github.event.inputs.kernel_repo }}" android-kernel
+          fi
+
+      - name: Build kernel (generates out/ used for module build)
+        run: |
+          set -eux
+          cd android-kernel
+          if [ "${{ github.event.inputs.include_ksu }}" = "true" ]; then
+            bash build.sh "${{ github.event.inputs.device }}" ksu
+          else
+            bash build.sh "${{ github.event.inputs.device }}"
+          fi
+
+      - name: modules_prepare (required for external modules)
+        run: |
+          set -eux
+          cd android-kernel
+          export PATH="$HOME/zyc-clang/bin:$PATH"
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+
+          # build.sh output dir is 'out' (based on your kernel workflow artifacts)
+          make O=out modules_prepare
+
+      - name: Build external modules (.ko)
+        run: |
+          set -eux
+          cd android-kernel
+          export PATH="$HOME/zyc-clang/bin:$PATH"
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+
+          # Build ALL obj-m targets in your Makefile:
+          make O=out M="${GITHUB_WORKSPACE}/kerneldriver" modules -j"$(nproc)"
+
+          echo "=== Built .ko files ==="
+          find "${GITHUB_WORKSPACE}/kerneldriver" -maxdepth 2 -name "*.ko" -print
+
+      - name: Collect artifacts
+        run: |
+          set -eux
+          rm -rf artifacts
+          mkdir -p artifacts
+          find kerneldriver -name "*.ko" -exec cp -v {} artifacts/ \;
+
+      - name: Upload module artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.device }}-modules
+          path: artifacts/*.ko
